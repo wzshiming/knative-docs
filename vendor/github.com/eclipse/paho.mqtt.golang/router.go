@@ -1,10 +1,14 @@
 /*
- * Copyright (c) 2013 IBM Corp.
+ * Copyright (c) 2021 IBM Corp and others.
  *
  * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the Eclipse Public License v1.0
- * which accompanies this distribution, and is available at
- * http://www.eclipse.org/legal/epl-v10.html
+ * are made available under the terms of the Eclipse Public License v2.0
+ * and Eclipse Distribution License v1.0 which accompany this distribution.
+ *
+ * The Eclipse Public License is available at
+ *    https://www.eclipse.org/legal/epl-2.0/
+ * and the Eclipse Distribution License is available at
+ *   http://www.eclipse.org/org/documents/edl-v10.php.
  *
  * Contributors:
  *    Seth Hoenig
@@ -37,17 +41,11 @@ type route struct {
 // and returns a boolean of the outcome
 func match(route []string, topic []string) bool {
 	if len(route) == 0 {
-		if len(topic) == 0 {
-			return true
-		}
-		return false
+		return len(topic) == 0
 	}
 
 	if len(topic) == 0 {
-		if route[0] == "#" {
-			return true
-		}
-		return false
+		return route[0] == "#"
 	}
 
 	if route[0] == "#" {
@@ -87,15 +85,13 @@ type router struct {
 	routes         *list.List
 	defaultHandler MessageHandler
 	messages       chan *packets.PublishPacket
-	stop           chan bool
 }
 
 // newRouter returns a new instance of a Router and channel which can be used to tell the Router
 // to stop
-func newRouter() (*router, chan bool) {
-	router := &router{routes: list.New(), messages: make(chan *packets.PublishPacket), stop: make(chan bool)}
-	stop := router.stop
-	return router, stop
+func newRouter() *router {
+	router := &router{routes: list.New(), messages: make(chan *packets.PublishPacket)}
+	return router
 }
 
 // addRoute takes a topic string and MessageHandler callback. It looks in the current list of
@@ -105,7 +101,7 @@ func (r *router) addRoute(topic string, callback MessageHandler) {
 	r.Lock()
 	defer r.Unlock()
 	for e := r.routes.Front(); e != nil; e = e.Next() {
-		if e.Value.(*route).match(topic) {
+		if e.Value.(*route).topic == topic {
 			r := e.Value.(*route)
 			r.callback = callback
 			return
@@ -120,7 +116,7 @@ func (r *router) deleteRoute(topic string) {
 	r.Lock()
 	defer r.Unlock()
 	for e := r.routes.Front(); e != nil; e = e.Next() {
-		if e.Value.(*route).match(topic) {
+		if e.Value.(*route).topic == topic {
 			r.routes.Remove(e)
 			return
 		}
@@ -139,38 +135,80 @@ func (r *router) setDefaultHandler(handler MessageHandler) {
 // takes messages off the channel, matches them against the internal route list and calls the
 // associated callback (or the defaultHandler, if one exists and no other route matched). If
 // anything is sent down the stop channel the function will end.
-func (r *router) matchAndDispatch(messages <-chan *packets.PublishPacket, order bool, client *client) {
-	go func() {
-		for {
-			select {
-			case message := <-messages:
-				sent := false
-				r.RLock()
-				handlers := []MessageHandler{}
-				for e := r.routes.Front(); e != nil; e = e.Next() {
-					if e.Value.(*route).match(message.TopicName) {
-						if order {
-							handlers = append(handlers, e.Value.(*route).callback)
-						} else {
-							go e.Value.(*route).callback(client, messageFromPublish(message))
-						}
-						sent = true
+func (r *router) matchAndDispatch(messages <-chan *packets.PublishPacket, order bool, client *client) <-chan *PacketAndToken {
+	ackChan := make(chan *PacketAndToken) // Channel returned to caller; closed when goroutine terminates
+
+	// In some cases message acknowledgments may come through after shutdown (connection is down etc). Where this is the
+	// case we need to accept any such requests and then ignore them. Note that this is not a perfect solution, if we
+	// have reconnected, and the session is still live, then the Ack really should be sent (see Issus #726)
+	var ackMutex sync.RWMutex
+	sendAckChan := ackChan // This will be set to nil before ackChan is closed
+	sendAck := func(ack *PacketAndToken) {
+		ackMutex.RLock()
+		defer ackMutex.RUnlock()
+		if sendAckChan != nil {
+			sendAckChan <- ack
+		} else {
+			DEBUG.Println(ROU, "matchAndDispatch received acknowledgment after processing stopped (ACK dropped).")
+		}
+	}
+
+	go func() { // Main go routine handling inbound messages
+		var handlers []MessageHandler
+		for message := range messages {
+			// DEBUG.Println(ROU, "matchAndDispatch received message")
+			sent := false
+			r.RLock()
+			m := messageFromPublish(message, ackFunc(sendAck, client.persist, message))
+			for e := r.routes.Front(); e != nil; e = e.Next() {
+				if e.Value.(*route).match(message.TopicName) {
+					if order {
+						handlers = append(handlers, e.Value.(*route).callback)
+					} else {
+						hd := e.Value.(*route).callback
+						go func() {
+							hd(client, m)
+							if !client.options.AutoAckDisabled {
+								m.Ack()
+							}
+						}()
 					}
+					sent = true
 				}
-				if !sent && r.defaultHandler != nil {
+			}
+			if !sent {
+				if r.defaultHandler != nil {
 					if order {
 						handlers = append(handlers, r.defaultHandler)
 					} else {
-						go r.defaultHandler(client, messageFromPublish(message))
+						go func() {
+							r.defaultHandler(client, m)
+							if !client.options.AutoAckDisabled {
+								m.Ack()
+							}
+						}()
+					}
+				} else {
+					DEBUG.Println(ROU, "matchAndDispatch received message and no handler was available. Message will NOT be acknowledged.")
+				}
+			}
+			r.RUnlock()
+			if order {
+				for _, handler := range handlers {
+					handler(client, m)
+					if !client.options.AutoAckDisabled {
+						m.Ack()
 					}
 				}
-				r.RUnlock()
-				for _, handler := range handlers {
-					handler(client, messageFromPublish(message))
-				}
-			case <-r.stop:
-				return
+				handlers = handlers[:0]
 			}
+			// DEBUG.Println(ROU, "matchAndDispatch handled message")
 		}
+		ackMutex.Lock()
+		sendAckChan = nil
+		ackMutex.Unlock()
+		close(ackChan) // as sendAckChan is now nil nothing further will be sent on this
+		DEBUG.Println(ROU, "matchAndDispatch exiting")
 	}()
+	return ackChan
 }
